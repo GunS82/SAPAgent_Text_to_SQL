@@ -4,20 +4,73 @@ import time
 import json
 import re
 import logging
-
+import win32clipboard
+from pysapscript import Sapscript, exceptions
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.disable(logging.CRITICAL)
 
-import logging
-import time
-import win32clipboard
-from pysapscript import Sapscript, exceptions
+def is_query_read_only(sql_query: str) -> tuple[bool, str]:
+    """
+    Проверяет, является ли SQL-запрос только читающим (SELECT).
+    Возвращает (True, "") если запрос разрешен, иначе (False, "причина блокировки").
+    """
+    # Удаляем комментарии и приводим к верхнему регистру для проверки
+    query_clean = re.sub(r'--.*$', '', sql_query, flags=re.MULTILINE)  # Однострочные комментарии
+    query_clean = re.sub(r'/\*.*?\*/', '', query_clean, flags=re.DOTALL)  # Многострочные комментарии
+    query_upper = query_clean.strip().upper()
+    
+    # Список запрещенных ключевых слов для модификации данных
+    forbidden_keywords = [
+        r'\bINSERT\b',      # Добавление данных
+        r'\bUPDATE\b',      # Изменение данных
+        r'\bDELETE\b',      # Удаление данных
+        r'\bDROP\b',        # Удаление таблиц/объектов
+        r'\bTRUNCATE\b',    # Очистка таблицы
+        r'\bALTER\b',       # Изменение структуры
+        r'\bCREATE\b',      # Создание объектов
+        r'\bREPLACE\b',     # Замена данных
+        r'\bMERGE\b',       # Слияние данных
+        r'\bEXEC\b',        # Выполнение процедур
+        r'\bEXECUTE\b',     # Выполнение процедур
+        r'\bCALL\b',        # Вызов процедур
+        r'\bGRANT\b',       # Управление правами
+        r'\bREVOKE\b',      # Отзыв прав
+    ]
+    
+    # Проверка на запрещенные операции
+    for keyword_pattern in forbidden_keywords:
+        if re.search(keyword_pattern, query_upper):
+            keyword = keyword_pattern.replace(r'\b', '').replace('\\', '')
+            return False, f"Запрещена операция: {keyword}"
+    
+    # Проверка на SELECT INTO (создает новую таблицу)
+    if re.search(r'\bSELECT\b.*\bINTO\b', query_upper, re.DOTALL):
+        return False, "Запрещена операция: SELECT INTO"
+    
+    # Проверка, что запрос начинается с SELECT или WITH (для CTE)
+    if not (query_upper.startswith('SELECT') or query_upper.startswith('WITH')):
+        return False, "Разрешены только SELECT запросы"
+    
+    return True, ""
 
 def run_sap_sql_query(sql_query: str) -> dict:
     """
     Выполняет SQL-запрос в SAP и возвращает результат выполнения, статус и сообщение.
+    Блокирует все запросы на изменение/удаление данных.
     """
+    # Валидация запроса перед выполнением
+    is_allowed, block_reason = is_query_read_only(sql_query)
+    if not is_allowed:
+        error_msg = f"Запрос заблокирован: {block_reason}"
+        logging.warning(error_msg)
+        logging.warning(f"Заблокированный запрос: {sql_query}")
+        return {
+            "status": False,
+            "message": error_msg,
+            "result": "Запрос заблокирован системой безопасности"
+        }
+    
     sap = Sapscript()
     win = sap.attach_window(0, 0)
     
@@ -33,15 +86,14 @@ def run_sap_sql_query(sql_query: str) -> dict:
         win.press("wnd[0]/tbar[1]/btn[8]")
         
         # Check ALV table for success or error
-        #alv_table_id = "/app/con[0]/ses[0]/wnd[0]/shellcont[0]/shell"
         alv_table_id = "wnd[0]/shellcont[0]/shell"
         alv_table = win.read_shell_table(alv_table_id)
         icon_value = alv_table.cell(0, "ICON")
         
-        if icon_value.startswith("@8O\\Q"):  # Проверка на наличие иконки ошибки
+        if icon_value.startswith(r"@8O\Q"):  # Проверка на наличие иконки ошибки
             error_message = alv_table.cell(0, "MESSAGE")
             return {"status": False, "message": error_message, "result": "Ошибка выполнения"}
-        elif icon_value.startswith("@5B\\Q"):  # Проверка на успех выполнения
+        elif icon_value.startswith(r"@5B\Q"):  # Проверка на успех выполнения
             success_message = alv_table.cell(0, "MESSAGE")
             logging.info("Query executed successfully, proceeding to export results...")
 
